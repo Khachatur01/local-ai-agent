@@ -18,25 +18,45 @@
       mkScript = import ./nix/mk-script.nix { inherit pkgs settings; };
 
       agent = import ./nix/agent.nix { inherit mkScript pkgs; };
+      router = import ./nix/router.nix { inherit pkgs settings; };
+      hybrid = import ./nix/hybrid.nix {
+        inherit
+          mkScript
+          pkgs
+          router
+          settings
+          ;
+      };
       setup = import ./nix/setup.nix { inherit mkScript; };
-      doctor = import ./nix/doctor.nix { inherit mkScript; };
+      doctor = import ./nix/doctor.nix { inherit mkScript pkgs; };
       bench = import ./nix/bench.nix { inherit mkScript; };
+      usage = import ./nix/usage.nix { inherit mkScript; };
 
       allScripts = [
         agent
+        hybrid
         setup
         doctor
         bench
+        usage
       ];
+
+      # The router is a python derivation rather than an mkScript one, so it
+      # is not in allScripts (which the nixos module iterates for shell
+      # applications) but still has to land on PATH wherever the scripts do.
+      allPackages = allScripts ++ [ router ];
     in
     {
       packages.${system} = {
         default = agent;
         inherit
           agent
+          hybrid
+          router
           setup
           doctor
           bench
+          usage
           ;
         ollama = pkgs.ollama-cuda;
       };
@@ -62,10 +82,25 @@
           program = "${bench}/bin/local-ai-bench";
           meta.description = "Measure prefill, cached prefill and generation";
         };
+        hybrid = {
+          type = "app";
+          program = "${hybrid}/bin/hybrid-agent";
+          meta.description = "Start Claude Code on Claude, with local subagents";
+        };
+        router = {
+          type = "app";
+          program = "${router}/bin/local-ai-router";
+          meta.description = "Run the model-dispatch router on its own";
+        };
+        usage = {
+          type = "app";
+          program = "${usage}/bin/local-ai-usage";
+          meta.description = "Report the local-vs-remote token split";
+        };
       };
 
       nixosModules.default = import ./nix/nixos-module.nix {
-        agentPackages = allScripts;
+        agentPackages = allPackages;
         inherit settings;
       };
 
@@ -74,9 +109,12 @@
       checks.${system} = {
         inherit
           agent
+          hybrid
+          router
           setup
           doctor
           bench
+          usage
           ;
 
         lint =
@@ -96,7 +134,7 @@
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = allScripts ++ [
+        packages = allPackages ++ [
           pkgs.ollama-cuda
           pkgs.claude-code
           pkgs.git
@@ -110,7 +148,10 @@
           echo "  local-ai-setup   pull + build models (run once)"
           echo "  local-ai-doctor  check context, eviction, cache settings"
           echo "  local-ai-bench   measure prefill and generation"
-          echo "  agent            start Claude Code on ${settings.agentModel}"
+          echo "  local-ai-usage   local-vs-remote token split (hybrid mode)"
+          echo "  agent            start Claude Code on ${settings.agentModel} (all local, free, slow)"
+          echo "  hybrid-agent     start Claude Code on ${settings.hybrid.remoteMainModel}, with"
+          echo "                   ${settings.agentModel} subagents for the read-heavy work"
           echo ""
           echo "  context ${settings.defaultNumCtx} (override with AGENT_NUM_CTX)"
         '';

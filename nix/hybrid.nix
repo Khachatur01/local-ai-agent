@@ -39,7 +39,6 @@ mkScript {
   ];
 
   text = ''
-    export ROUTER_ADDR="''${ROUTER_ADDR:-${hybrid.routerAddr}}"
     export ROUTER_BIN="${router}/bin/local-ai-router"
     export HYBRID_MODEL="''${HYBRID_MODEL:-${hybrid.remoteMainModel}}"
     CLASSIFIER_MODEL="''${HYBRID_CLASSIFIER_MODEL:-${hybrid.remoteClassifierModel}}"
@@ -87,7 +86,8 @@ mkScript {
     # so that an AGENT_NUM_CTX override reaches the guard too.
     export ROUTER_LOCAL_MODELS="$AGENT_MODEL:$NUM_CTX,$FAST_MODEL:$FAST_NUM_CTX"
     export ROUTER_LOCAL_API="$API"
-    export ROUTER_USAGE_LOG="$(cache_dir)/router-usage.jsonl"
+    ROUTER_USAGE_LOG="$(cache_dir)/router-usage.jsonl"
+    export ROUTER_USAGE_LOG
     export ROUTER_LOCAL_TIMEOUT_S="''${ROUTER_LOCAL_TIMEOUT_S:-1800}"
     ensure_router
 
@@ -97,7 +97,7 @@ mkScript {
     # go to Anthropic — the exact opposite of the point.
     routed="$(router_local_models)"
     if ! printf '%s\n' "$routed" | grep -Fx "$AGENT_MODEL" >/dev/null; then
-      die "the router on $ROUTER_ADDR does not route '$AGENT_MODEL' (it routes: $(printf '%s ' $routed)) — it was started with a different table; stop it and re-run"
+      die "the router on $ROUTER_ADDR does not route '$AGENT_MODEL' (it routes: $(printf '%s' "$routed" | tr '\n' ' ')) — it was started with a different table; stop it and re-run"
     fi
 
     PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"

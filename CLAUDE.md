@@ -1,7 +1,9 @@
 # local-ai-agent
 
-A Nix flake that runs Claude Code against a locally served Ollama model, so
-agentic development works with no API calls leaving the machine.
+A Nix flake that drives Claude Code from a locally served Ollama model, so
+agentic development works with no API calls leaving the machine — and, in
+hybrid mode, a Claude main loop that delegates its bulk reading to that local
+model instead of paying quota for it.
 
 ## Layout
 
@@ -10,25 +12,44 @@ flake.nix              wiring only — no logic
 nix/settings.nix       model names, sizing, server env; single source of truth
 nix/mk-script.nix      builds a script with the settings prelude + helpers
 nix/common.sh          shared shell helpers (sourced, never executed)
-nix/agent.nix          launcher: verify, warm, exec claude
+nix/agent.nix          launcher: verify, warm, exec claude (all local)
+nix/hybrid.nix         launcher: Claude main loop + local subagents
+nix/router.nix         packaging for the model-dispatch router
+nix/router.py          the router itself: dispatch on the request's model
 nix/setup.nix          one-time provisioning (pull + ollama create)
 nix/doctor.nix         diagnose every known failure mode
 nix/bench.nix          measure prefill / cached prefill / generation
+nix/usage.nix          local-vs-remote token split, from the router's log
 nix/nixos-module.nix   services.local-ai-agent (opt-in; not needed to run)
 ```
 
-Commands: `local-ai-setup` (once), `local-ai-doctor`, `local-ai-bench`,
-`agent`. All four are in the devShell and exposed as `nix run .#setup`,
-`.#doctor`, `.#bench` and `nix run .` respectively.
+Two launchers, for two different costs:
 
-`agent` never mutates anything — all provisioning lives in `setup`, so
+| | `agent` | `hybrid-agent` |
+| --- | --- | --- |
+| Main loop | `qwen3.6-agent`, local | a real Claude model |
+| Subagents | local | local |
+| Costs | wall-clock | quota, but much less of it |
+| Needs an account | no | yes |
+
+Commands: `local-ai-setup` (once), `local-ai-doctor`, `local-ai-bench`,
+`local-ai-usage`, `agent`, `hybrid-agent`. All are in the devShell and
+exposed as `nix run .#setup`, `.#doctor`, `.#bench`, `.#usage`, `.#hybrid`,
+`.#router` and `nix run .` respectively.
+
+Neither launcher mutates anything — all provisioning lives in `setup`, so
 launching is fast and side-effect free. If a model is missing or has drifted,
-`agent` fails fast and points at `setup`.
+both fail fast and point at `setup`.
 
 ## The performance model (measured on this box)
 
-RTX 3060 Laptop, **6 GB VRAM**, 30 GB RAM. The 35B Q4_K_M is ~22 GB, so only
-34 of 42 layers offload and it runs ~89% on CPU.
+RTX 3060 Laptop, **6 GB VRAM**, 30 GB RAM. The 35B Q4_K_M is ~22 GB, and it
+runs ~89% on CPU. The split is subtler than a layer count suggests — ollama
+now reports `offloaded 42/42 layers to GPU`, yet `ollama ps` shows only
+~2.8 GB of the 22.7 GB in VRAM, because the MoE expert tensors stay in RAM.
+So the attention path is on the GPU and the experts, which dominate the
+work, are not. (An earlier version of this file said "34 of 42 layers",
+measured before KV cache quantization freed the VRAM to offload the rest.)
 
 | What | Measured |
 | --- | --- |
@@ -60,6 +81,143 @@ grep -E 'n_ctx_slot|task.n_tokens' ~/.cache/local-ai-agent/ollama.log
 
 Two consecutive turns should show nearly identical `task.n_tokens` with only
 the second being fast.
+
+## Hybrid mode: Claude reasons, qwen does the reading
+
+`agent` is free and slow. Running Claude Code entirely on Claude is fast and
+burns quota quickly — and it does so for a reason worth naming precisely:
+**what consumes the budget is tool-result bulk, not thinking.** Every turn
+re-sends the whole transcript, and the transcript is mostly file reads, grep
+output and command output. A 40-file sweep is paid for again on every
+subsequent turn of that session.
+
+`hybrid-agent` exists because of one asymmetry: **a subagent's transcript is
+discarded when it finishes — only its final report reaches the main
+conversation.** So the main loop runs on Claude, and the agents in
+`.claude/agents/local-*.md` are pinned to `qwen3.6-agent`. The 40 files get
+read on this machine; Claude receives a few hundred tokens of summary.
+
+### Why a router is required
+
+Claude Code 2.1.223 has exactly **one** `ANTHROPIC_BASE_URL`. Its only
+alternates are provider-specific — `ANTHROPIC_BEDROCK_BASE_URL`,
+`ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_FOUNDRY_BASE_URL`,
+`ANTHROPIC_GOOGLE_CLOUD_BASE_URL` — so there is no supported way to say "this
+model over there, that model over here". `nix/router.py` is that missing
+piece: it speaks the same API on loopback and dispatches on the `model` field
+of each request body.
+
+What makes the whole design work is that subagent model names are honoured
+verbatim. From the 2.1.223 bundle:
+
+```js
+del==="default"?TT():t.model,s=i,a=o?.model,l;if(!i&&a&&a!=="inherit")l=a,i=Bi(a),s=a
+```
+
+`a` is the agent definition's `model:`. Any string that is not `"inherit"` is
+used as-is, which is what lets a frontmatter line name an ollama model.
+
+Measured: the router adds nothing detectable. Three `qwen3-fast` round trips
+direct to ollama were 0.126/0.088/0.089 s; the same three through the router
+were 0.090/0.087/0.090 s.
+
+### The routing rule: default-remote
+
+Only the models in `ROUTER_LOCAL_MODELS` go to ollama. **Everything else goes
+to Anthropic, including paths the router does not recognise** — Claude Code
+also talks to its base URL for OAuth refresh and policy limits
+(`firstPartyApi: refreshOAuth failed`, `loadPolicyLimits` in the bundle), and
+swallowing those breaks a subscription session.
+
+The cost of that choice is that an unrouted model name does not fail — it
+quietly becomes a billable Claude call, which is the exact opposite of the
+point. Three things guard against it, because this is the failure that would
+be invisible:
+
+- `hybrid-agent` refuses to start if the live router does not route
+  `$AGENT_MODEL`, naming what it does route instead.
+- `local-ai-doctor` checks the same thing, plus that every
+  `.claude/agents/local-*.md` names exactly `agentModel` from
+  `nix/settings.nix`.
+- `local-ai-usage` reports the local/remote token split, so a regression
+  shows up as a number rather than as a surprise at the end of the month.
+
+The table is built by the launcher, not baked into the router package, so an
+`AGENT_NUM_CTX` override reaches the truncation guard too.
+
+### Auth: two modes, neither free of tradeoffs
+
+Pointing `ANTHROPIC_BASE_URL` at the router means Claude Code is no longer
+talking to `api.anthropic.com` directly, and that changes how it
+authenticates.
+
+- **subscription (default).** Claude Code only sends its OAuth token to a base
+  URL it considers first-party. `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`
+  makes it treat the router as one. The leading underscore is upstream's and
+  it means what it looks like: internal, undocumented, free to disappear in
+  any release. That is the entire reason the other mode exists.
+- **`--api-key`.** Supported and stable, but it moves the session off
+  subscription limits and onto pay-per-token billing — it converts a quota
+  problem into a money one. Hence not the default.
+
+The router never inspects a credential; it forwards whatever header arrives.
+It also refuses to bind anything but loopback, and its access log is
+deliberately silenced — it handles a live token and has no authentication of
+its own.
+
+### What side calls do here, and why it differs from `agent`
+
+| Slot | `agent` | `hybrid-agent` | Why |
+| --- | --- | --- | --- |
+| main | local 35B | Claude | reasoning |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `qwen3-fast` | `qwen3-fast` | titles, summaries: small and tolerant |
+| `CLAUDE_CODE_AUTO_MODE_MODEL` | `qwen3-fast` | **Claude Haiku** | carries the whole transcript |
+| `CLAUDE_CODE_BG_CLASSIFIER_MODEL` | `qwen3-fast` | **Claude Haiku** | same |
+| `CLAUDE_CONTEXT_COLLAPSE_MODEL` | — | **Claude Haiku** | gets the entire window by definition |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `$NUM_CTX` | **unset** | the window is Claude's now |
+
+The three reversals are deliberate and are the same single reason: in `agent`
+the main model *is* local and bounded at 65k, so a side call carrying the
+transcript still fits. In hybrid mode the transcript is a Claude one and can
+be far larger than `fastNumCtx` — and ollama's response to an over-long
+prompt is to truncate it and mention that only in its own log (failure mode
+1). Auto mode would then go on approving tool calls from a fragment of its
+prompt: quickly, and wrongly. A silently-truncated safety classifier is worse
+than a remote one that costs a fraction of a cent.
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` being unset follows from the same place.
+Pinning it to `$NUM_CTX` would make Claude Code compact a 200k-capable
+session at 65k. The consequence is that nothing bounds a *local subagent's*
+prompt, so the router warns when one exceeds `num_ctx/2`:
+
+```
+router: WARNING: qwen3-fast prompt is ~15019 tokens but only ~8192 are usable
+at num_ctx=16384 — ollama will truncate it silently
+```
+
+That warning is the guard working. `local-ai-doctor` counts them.
+
+### An upside specific to this mode
+
+With the main loop remote, the local 35B's single slot serves **only**
+subagents. There is no longer a main-session KV cache for a side call to
+overwrite, so failure mode 2's worst consequence — a classifier attempt
+destroying the conversation's prefix and making the next real turn re-prefill
+— does not apply here at all.
+
+### What it costs
+
+Wall-clock, and not a little. Each *distinct* subagent type is its own cold
+prefill, because its prompt prefix does not match anything already in the
+slot: ~3 min for a 27k prompt at the measured 155 tok/s, then ~11 tok/s to
+write its report. Repeat calls to the *same* agent reuse the prefix and are
+far cheaper, which is why there are two broad agents rather than six narrow
+ones — and why adding a third should be a deliberate decision.
+
+So this is a money-for-time trade, and it is only worth taking for work that
+is wide, shallow and boring. Reasoning, design and anything subtle should stay
+on Claude; delegating those to a 35B does not save anything, it just produces
+a confident answer that has to be redone.
 
 ## Failure mode 1: silent context truncation
 
@@ -209,23 +367,71 @@ ollama log with a multi-minute duration. `local-ai-doctor` now checks
 
 ## Sizing the two contexts
 
-These two values compete for the same 30 GB, and there is no setting that
-makes both ideal:
+The two windows do **not** compete for the same resource, which is the thing
+an earlier version of this section got wrong. Measured from the runners'
+own allocation lines:
 
-- `defaultNumCtx` (main) = **65536**. Auto-compaction forces a full cold
-  re-prefill, so a bigger window means rarer compactions.
-- `fastNumCtx` (classifier) = **16384**. KV is ~120 KB/token for this model,
-  so each doubling is expensive. Side calls above ~8k tokens truncate, which
-  is a real but lesser cost than losing main-model prefill speed — Claude
-  Code has been observed sending 10,295-token side calls.
+| Model | num_ctx | KV allocated | Per token | Where |
+| --- | --- | --- | --- | --- |
+| `qwen3.6-agent` (35B) | 65536 | **808 MiB** | ~12.6 KB | CUDA0 (VRAM) |
+| `qwen3-fast` (1.7B) | 16384 | **952 MiB** | ~58 KB | CPU (RAM) |
 
-Note that the usable prompt is roughly `num_ctx/2`; ollama reserves the rest
-for the response (4096 → limit 2050, 8192 → limit 4098).
+```
+llama_kv_cache: size = 680.00 MiB ( 65536 cells, 10 layers, 1/1 seqs), K (q8_0): 340.00 MiB, V (q8_0): 340.00 MiB
+llama_kv_cache: size = 128.00 MiB ( 65536 cells,  1 layers, 1/1 seqs), K (f16):   64.00 MiB, V (f16):   64.00 MiB
+llama_kv_cache: size = 952.00 MiB ( 16384 cells, 28 layers, 1/1 seqs), K (q8_0): 476.00 MiB, V (q8_0): 476.00 MiB
+```
 
-Raising either is reasonable **after** `OLLAMA_KV_CACHE_TYPE=q8_0` is active,
-which roughly halves KV. Watch `page cache` in `local-ai-doctor` rather than
-available memory, and there is no swap on this machine — exhausting RAM means
-an OOM kill, not a slowdown.
+**The 35B costs four and a half times less per token than the 1.7B.** Read
+the layer counts: `10 layers` and `1 layers` out of 42. `qwen35moe` is a
+hybrid-attention architecture, so only a handful of layers hold a KV cache at
+all, while the dense 1.7B pays for all 28. KV does not scale with parameter
+count; it scales with how many layers do full attention.
+
+This inverts the old conclusion that the main window was the expensive one:
+
+- `defaultNumCtx` (main) = **131072**. Each doubling costs ~808 MiB **of
+  VRAM**, so free VRAM is the constraint — not the page cache. Measured 4987
+  of 6144 MiB in use, leaving ~1157 MiB, so one doubling fits with ~350 MiB
+  spare. The ceiling is 262144, the model's own context length.
+- `fastNumCtx` (classifier) = **16384**. This is the genuinely expensive one,
+  at 58 KB/token in RAM, and it is what failure mode 4 was really about.
+  Side calls above ~8k tokens truncate — a real but lesser cost than losing
+  main-model prefill speed. Claude Code has been observed sending
+  10,295-token side calls.
+
+When raising the main window, watch **VRAM and the layer offload**, not the
+page cache. The failure is quiet: if KV stops fitting, ollama does not error,
+it offloads fewer layers and prefill simply gets slower. `local-ai-doctor`
+checks `offloaded N/N layers to GPU` and reports the measured KV for that
+reason. Note that `42/42` does not mean the weights are in VRAM — only
+~2.8 GB of the 22.7 GB is; the MoE expert tensors stay in RAM, which is why
+the page-cache cliff still exists and why this is ~89% a CPU workload.
+
+`fastNumCtx` is still bounded by the page cache, and there is no swap on this
+machine — exhausting RAM means an OOM kill, not a slowdown.
+
+### What raising it actually buys, per launcher
+
+- **`agent`** — directly. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is pinned to
+  `$NUM_CTX`, so auto-compaction fires as a fraction of it. At 65536 a ~27k
+  system prompt leaves the session roughly 40% full before any work happens,
+  which is why compaction arrived so quickly; at 131072 that same prompt is
+  ~20%, so compactions roughly halve.
+- **`hybrid-agent`** — not for the main loop. There
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is deliberately unset and compaction is
+  governed by Claude's own window, which this setting cannot change. What it
+  does buy is headroom for **local subagents**: a larger window for
+  `local-explore` before the router's truncation warning fires.
+
+One caveat in both cases: a bigger window permits a bigger prompt, and cold
+prefill is linear in prompt size at ~155 tok/s. Compaction is still the
+thing worth avoiding — warm turns stay ~4 s regardless — but a 120k-token
+cold prefill is minutes, so the win is fewer compactions, not faster turns.
+
+Changing either value needs `nix run .#setup` to rebuild the derived model;
+`agent` and `hybrid-agent` will refuse to start until it matches, naming the
+drift.
 
 ## Conventions
 
@@ -241,3 +447,18 @@ an OOM kill, not a slowdown.
     `|| true`.
   - `head -c` / `grep -q` ending a pipeline SIGPIPEs upstream producers, and
     `pipefail` turns that into exit 141 — even on success.
+  - `'''` inside a `''…''` Nix string is the escape for a literal `''`, not a
+    quote followed by an interpolation. So a shell line like
+    `'${want:-unset}'` written inside one silently becomes something else
+    entirely — statix reported it as an "unquoted URI expression" several
+    lines further on, which is not a useful pointer. Rephrase to avoid the
+    adjacency rather than trying to escape your way out.
+- `nix/router.py` is stdlib-only on purpose: it sits in the path of every API
+  call a hybrid session makes, so a dependency there is one more thing that
+  can take a session down. `writePython3Bin` runs flake8 at build time;
+  `E501` is ignored because the comments explaining each failure mode are
+  worth more than a 79-column limit.
+- The router's `/healthz` is the interface `doctor` and `hybrid-agent` use to
+  ask what it is *actually* routing, rather than inferring it from `/proc`.
+  A router someone left running with a different table is the drift worth
+  catching, and only the router knows how it parsed its own.

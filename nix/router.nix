@@ -13,13 +13,10 @@ let
   # can break a session. flake8 runs as part of the build; E501 is ignored
   # because the comments explaining each failure mode are worth more than a
   # 79-column limit.
-  server =
-    pkgs.writers.writePython3Bin "local-ai-router-unwrapped"
-      {
-        libraries = [ ];
-        flakeIgnore = [ "E501" ];
-      }
-      (builtins.readFile ./router.py);
+  server = pkgs.writers.writePython3Bin "local-ai-router-unwrapped" {
+    libraries = [ ];
+    flakeIgnore = [ "E501" ];
+  } (builtins.readFile ./router.py);
 
   inherit (settings) hybrid;
   table = "${settings.agentModel}:${settings.defaultNumCtx},${settings.fastModel}:${settings.fastNumCtx}";

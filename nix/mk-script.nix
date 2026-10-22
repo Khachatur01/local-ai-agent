@@ -48,6 +48,10 @@ pkgs.writeShellApplication {
     export OLLAMA_ADDR="''${OLLAMA_HOST:-127.0.0.1:11434}"
     export API="http://$OLLAMA_ADDR"
 
+    # Hybrid mode: hybrid-agent and local-ai-doctor have to agree on where
+    # the model-dispatch router lives.
+    export ROUTER_ADDR="''${ROUTER_ADDR:-${settings.hybrid.routerAddr}}"
+
     # The server settings ensure_server has to pass on when it starts ollama
     # itself. Not exported: an array cannot be, and common.sh is sourced into
     # the same shell anyway.

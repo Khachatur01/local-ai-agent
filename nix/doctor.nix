@@ -3,10 +3,13 @@
 # Every check names the fix, because each of these failed silently at least
 # once: truncated context looked like a careless agent, and model eviction
 # looked like a flaky server.
-{ mkScript }:
+{ mkScript, pkgs }:
 
 mkScript {
   name = "local-ai-doctor";
+
+  # git: the subagent-definition check resolves the project root.
+  runtimeInputs = [ pkgs.git ];
 
   text = ''
     fails=0
@@ -164,6 +167,38 @@ mkScript {
     else
       info "no nvidia-smi; skipping VRAM check"
     fi
+
+    # The quiet failure mode for defaultNumCtx. On this architecture KV is a
+    # CUDA0 buffer, so raising num_ctx spends VRAM, not the page cache that
+    # bounds the small model. When it stops fitting, ollama does not fail — it
+    # offloads fewer layers and carries on, and the only symptom is slower
+    # prefill. So check the offload itself rather than trusting the setting.
+    offload="$(server_log | grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' | tail -1 || true)"
+    if [ -n "$offload" ]; then
+      got_l="''${offload#offloaded }"
+      got_l="''${got_l%%/*}"
+      want_l="''${offload#*/}"
+      want_l="''${want_l%% *}"
+      if [ "$got_l" = "$want_l" ]; then
+        ok "$offload"
+      else
+        meh "only $offload — KV may have crowded the weights out of VRAM" \
+          "lower AGENT_NUM_CTX (each doubling of the main window costs ~808MiB of VRAM) and re-run setup; prefill goes slower when layers fall back to CPU"
+      fi
+    fi
+
+    # Report the measured KV allocation rather than predicting it. Two caches
+    # are listed per model on this architecture (q8_0 over the attention
+    # layers, f16 over one more), so both lines are summed — and only the last
+    # pair, since the log accumulates one set per model load.
+    kvmib="$(server_log \
+      | grep -oE 'llama_kv_cache: size = *[0-9]+\.[0-9]+ MiB \( *'"$NUM_CTX"' cells' \
+      | tail -2 \
+      | grep -oE '[0-9]+\.[0-9]+' \
+      | awk '{ s += $1 } END { if (s > 0) printf "%.0f", s }' || true)"
+    if [ -n "$kvmib" ]; then
+      info "KV for $AGENT_MODEL at $NUM_CTX: ''${kvmib}MiB (~$((kvmib * 1024 / (NUM_CTX / 1024)))B/token)"
+    fi
     info "RAM $(free -g 2>/dev/null | awk '/^Mem:/ { print $3"G used / "$2"G total, "$7"G available" }')"
 
     # Loaded models are ~27GB of a 30GB box here. With no swap configured,
@@ -187,7 +222,7 @@ mkScript {
     cache_mb="$(free -m 2>/dev/null | awk '/^Mem:/ { print $6 }')"
     if model_resident "$AGENT_MODEL" && [ -n "$cache_mb" ] && [ "$cache_mb" -lt 18000 ]; then
       meh "page cache is only ''${cache_mb}MB but $AGENT_MODEL needs ~22GB of weights resident" \
-        "lower AGENT_FAST_NUM_CTX or AGENT_NUM_CTX — prefill goes disk-bound (~35 tok/s instead of ~151) when the weights fall out of cache"
+        "lower AGENT_FAST_NUM_CTX — that KV lives in RAM at ~58KB/token and comes straight out of this cache (the main window's KV is in VRAM, so AGENT_NUM_CTX is not the lever here). Prefill goes disk-bound (~35 tok/s instead of ~151) when the weights fall out of cache"
     else
       info "page cache ''${cache_mb:-?}MB"
     fi
@@ -242,6 +277,67 @@ mkScript {
         "raise $knob and re-run setup; if these predate a fix, they age out of the 1h window"
     else
       ok "no truncated prompts in the last hour"
+    fi
+
+    say ""
+    say "hybrid mode"
+    # All of this is informational when the router is down: plain 'agent'
+    # talks to ollama directly and needs none of it.
+    if ! router_up; then
+      info "no router on $ROUTER_ADDR — only needed by hybrid-agent"
+    else
+      ok "router reachable at $ROUTER_ADDR"
+
+      # A router started with a different table is the failure worth
+      # catching. It does not error: unrouted models just go to Anthropic, so
+      # the "local" subagents quietly become billable Claude calls.
+      routed="$(router_local_models)"
+      for m in "$AGENT_MODEL" "$FAST_MODEL"; do
+        if printf '%s\n' "$routed" | grep -Fx "$m" >/dev/null; then
+          ok "routes $m to ollama"
+        else
+          bad "the router does not route '$m' to ollama" \
+            "stop it and re-run hybrid-agent — requests for an unrouted model go to Anthropic and get billed, which is the cost hybrid mode exists to avoid"
+        fi
+      done
+
+      # The router's own truncation warning. Claude Code cannot bound a local
+      # subagent's prompt in hybrid mode, because CLAUDE_CODE_MAX_CONTEXT_TOKENS
+      # has to describe the Claude window there.
+      rlog="$(cache_dir)/router.log"
+      overruns="$(grep -c 'WARNING: .* will truncate it silently' "$rlog" 2>/dev/null || true)"
+      if [ "''${overruns:-0}" -gt 0 ]; then
+        meh "$overruns local request(s) exceeded the model window — see $rlog" \
+          "the subagent read too much; tighten its scope or raise AGENT_NUM_CTX. Ollama truncated those prompts and said so only in its own log"
+      else
+        info "no local-prompt overruns recorded"
+      fi
+    fi
+
+    # Model drift in the subagent definitions. A stale name here is silent in
+    # exactly the same way: Claude Code honours the frontmatter verbatim, the
+    # router does not recognise it, and the agent runs on Claude's bill.
+    root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    shopt -s nullglob
+    defs=("$root"/.claude/agents/local-*.md)
+    shopt -u nullglob
+    if [ "''${#defs[@]}" -eq 0 ]; then
+      info "no .claude/agents/local-*.md in $root — hybrid mode has nothing to offload to"
+    else
+      for def in "''${defs[@]}"; do
+        want="$(grep -m1 '^model:' "$def" | sed 's/^model:[[:space:]]*//' || true)"
+        if [ "$want" = "$AGENT_MODEL" ]; then
+          ok "$(basename "$def") -> $want"
+        else
+          bad "$(basename "$def") says model ''${want:-unset}, expected $AGENT_MODEL" \
+            "edit the frontmatter to match agentModel in nix/settings.nix — an unrouted name silently runs this agent on Claude instead"
+        fi
+      done
+    fi
+
+    ulog="$(cache_dir)/router-usage.jsonl"
+    if [ -s "$ulog" ]; then
+      info "$(wc -l <"$ulog") router request(s) recorded — run local-ai-usage for the token split"
     fi
 
     say ""

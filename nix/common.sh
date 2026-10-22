@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# Shared helpers for agent/setup/doctor/bench. Sourced, never executed.
+# Shared helpers for agent/hybrid/setup/doctor/bench. Sourced, never executed.
 #
 # Callers are expected to have already set: API, BASE_MODEL, AGENT_MODEL,
 # NUM_CTX, FAST_BASE_MODEL, FAST_MODEL, FAST_NUM_CTX, AGENT_NUM_GPU,
@@ -11,6 +11,16 @@ warn() { printf '%s\n' "$*" >&2; }
 die() {
   warn "$*"
   exit 1
+}
+
+# Where this flake keeps the logs of anything it starts itself. Four callers
+# need the same path (ensure_server, ensure_router, local-ai-usage and the
+# doctor's log reader), so it lives here rather than being spelled out again
+# in each one.
+cache_dir() {
+  local dir="${XDG_CACHE_HOME:-$HOME/.cache}/local-ai-agent"
+  mkdir -p "$dir"
+  printf '%s\n' "$dir"
 }
 
 server_up() {
@@ -67,9 +77,8 @@ ensure_server() {
     return 0
   fi
 
-  local log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/local-ai-agent"
-  local log="$log_dir/ollama.log"
-  mkdir -p "$log_dir"
+  local log
+  log="$(cache_dir)/ollama.log"
   # The settings in SERVER_ENV have to be passed explicitly. A server started
   # here inherits nothing from services.ollama, and the defaults it would
   # otherwise run with are the ones that produce every symptom this project
@@ -189,4 +198,54 @@ warm_model() {
 # into an errexit abort inside the caller's command substitution.
 json_num() {
   grep -oE "\"$2\":[0-9]+" <<<"$1" | head -1 | cut -d: -f2 || true
+}
+
+# --- hybrid mode: the model-dispatch router -------------------------------
+#
+# Callers that use these must also have set ROUTER_ADDR and ROUTER_BIN.
+
+router_up() {
+  curl -sf -m 2 "http://$ROUTER_ADDR/healthz" >/dev/null 2>&1
+}
+
+# Models the running router actually routes to ollama, one per line. Empty
+# when it is not reachable.
+#
+# Reads /healthz rather than /proc, because the router is the only thing that
+# knows how it parsed its own table — and because a router someone started by
+# hand with a different ROUTER_LOCAL_MODELS is exactly the drift worth
+# catching. The "|| true" is the usual pair of traps: grep exits 1 when the
+# field is absent, and a failing substitution aborts the caller.
+router_local_models() {
+  curl -sf -m 2 "http://$ROUTER_ADDR/healthz" 2>/dev/null \
+    | grep -oE '"local": *\[[^]]*\]' \
+    | grep -oE '"[^"]+"' \
+    | grep -v '^"local"$' \
+    | tr -d '"' \
+    || true
+}
+
+# Start the router only if nothing is already serving on its address, so a
+# second hybrid-agent in another terminal reuses the first one's.
+ensure_router() {
+  if router_up; then
+    return 0
+  fi
+
+  local log
+  log="$(cache_dir)/router.log"
+  say "starting local-ai-router on $ROUTER_ADDR (log: $log)"
+  nohup "$ROUTER_BIN" >>"$log" 2>&1 </dev/null &
+
+  # 15s, not the 60 ensure_server allows: this process loads no weights, so
+  # if it is not up in a second or two it is not coming up at all.
+  local i
+  for i in $(seq 1 15); do
+    if router_up; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  die "local-ai-router did not come up; see $log"
 }
