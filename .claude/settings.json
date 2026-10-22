@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nix flake *)",
+      "Bash(nix build *)",
+      "Bash(nix develop *)",
+      "Bash(nix eval *)",
+      "Bash(nix fmt *)",
+      "Bash(nix run .#doctor)",
+      "Bash(nix run .#bench)",
+      "Bash(statix check *)",
+      "Bash(deadnix *)",
+      "Bash(ollama list)",
+      "Bash(ollama ps)",
+      "Bash(ollama show *)",
+      "Bash(nvidia-smi *)",
+      "Bash(free *)",
+      "Bash(journalctl -u ollama *)",
+      "Bash(systemctl status ollama)",
+      "Bash(systemctl show ollama *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ]
+  }
+}

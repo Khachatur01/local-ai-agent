@@ -1,92 +1,118 @@
-
 {
-  description = "Local AI coding agent with Ollama CUDA and Qwen3.6";
+  description = "Local agentic development: Claude Code driven by a local Ollama model";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      projectName = builtins.baseNameOf (toString self);
 
       pkgs = import nixpkgs {
         inherit system;
         config.allowUnfree = true;
       };
 
-      ollama = pkgs.ollama-cuda;
-      model = "qwen3.6:35b-a3b";
+      settings = import ./nix/settings.nix;
 
-      agent = pkgs.writeShellApplication {
-        name = "agent";
+      mkScript = import ./nix/mk-script.nix { inherit pkgs settings; };
 
-        runtimeInputs = [
-          ollama
-          pkgs.coreutils
-          pkgs.gnugrep
-          pkgs.gawk
-        ];
+      agent = import ./nix/agent.nix { inherit mkScript pkgs; };
+      setup = import ./nix/setup.nix { inherit mkScript; };
+      doctor = import ./nix/doctor.nix { inherit mkScript; };
+      bench = import ./nix/bench.nix { inherit mkScript; };
 
-        text = ''
-          MODEL="${model}"
-          PROJECT_NAME="${projectName}"
-          OLLAMA_LOG="$HOME/.cache/$PROJECT_NAME/ollama.log"
-
-          # Start Ollama if it is not already running.
-          if ! ollama list >/dev/null 2>&1; then
-            mkdir -p "$(dirname "$OLLAMA_LOG")"
-
-            nohup ollama serve \
-              >"$OLLAMA_LOG" 2>&1 \
-              </dev/null &
-
-            echo "Starting Ollama..."
-
-            ready=0
-            for _ in $(seq 1 60); do
-              if ollama list >/dev/null 2>&1; then
-                ready=1
-                break
-              fi
-              sleep 1
-            done
-
-            if [ "$ready" -ne 1 ]; then
-              echo "Ollama failed to start. Log: $OLLAMA_LOG" >&2
-              exit 1
-            fi
-          fi
-
-          # Download the model on first use.
-          if ! ollama list |
-            awk 'NR > 1 { print $1 }' |
-            grep -Fxq "$MODEL"; then
-            ollama pull "$MODEL"
-          fi
-
-          # Launch Claude Code using Ollama.
-          exec ollama launch claude \
-            --model "$MODEL" \
-            --yes \
-            -- "$@"
-        '';
+      allScripts = [
+        agent
+        setup
+        doctor
+        bench
+      ];
+    in
+    {
+      packages.${system} = {
+        default = agent;
+        inherit
+          agent
+          setup
+          doctor
+          bench
+          ;
+        ollama = pkgs.ollama-cuda;
       };
 
-    in {
-      packages.${system} = {
-        default = ollama;
-        inherit agent;
+      apps.${system} = {
+        default = {
+          type = "app";
+          program = "${agent}/bin/agent";
+          meta.description = "Start Claude Code on the local model";
+        };
+        setup = {
+          type = "app";
+          program = "${setup}/bin/local-ai-setup";
+          meta.description = "Pull and build the local models (run once)";
+        };
+        doctor = {
+          type = "app";
+          program = "${doctor}/bin/local-ai-doctor";
+          meta.description = "Diagnose context, eviction and cache settings";
+        };
+        bench = {
+          type = "app";
+          program = "${bench}/bin/local-ai-bench";
+          meta.description = "Measure prefill, cached prefill and generation";
+        };
+      };
+
+      nixosModules.default = import ./nix/nixos-module.nix {
+        agentPackages = allScripts;
+        inherit settings;
+      };
+
+      formatter.${system} = pkgs.nixfmt-tree;
+
+      checks.${system} = {
+        inherit
+          agent
+          setup
+          doctor
+          bench
+          ;
+
+        lint =
+          pkgs.runCommand "lint"
+            {
+              nativeBuildInputs = [
+                pkgs.statix
+                pkgs.deadnix
+              ];
+            }
+            ''
+              cd ${self}
+              statix check .
+              deadnix --fail .
+              touch $out
+            '';
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          ollama
-          agent
+        packages = allScripts ++ [
+          pkgs.ollama-cuda
+          pkgs.claude-code
+          pkgs.git
+          pkgs.ripgrep
+          pkgs.statix
+          pkgs.deadnix
         ];
 
         shellHook = ''
-          echo "Local AI agent environment: ${projectName}"
-          echo "Run 'agent' to launch Claude Code with ${model}."
+          echo "local-ai-agent"
+          echo "  local-ai-setup   pull + build models (run once)"
+          echo "  local-ai-doctor  check context, eviction, cache settings"
+          echo "  local-ai-bench   measure prefill and generation"
+          echo "  agent            start Claude Code on ${settings.agentModel}"
+          echo ""
+          echo "  context ${settings.defaultNumCtx} (override with AGENT_NUM_CTX)"
         '';
       };
     };
