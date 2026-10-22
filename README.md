@@ -21,7 +21,7 @@ agent                # works from any git repo; starts at its root
 
 ```sh
 cd ~/some/other/repo
-nix run github:Khachatur01/local-ai-agent
+nix run github:Khachatur01/local-ai-agent-flake
 ```
 
 ## Commands
