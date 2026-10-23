@@ -1,160 +1,142 @@
 {
-  description = "Local agentic development: Claude Code driven by a local Ollama model";
+  description = "Local AI coding assistant with OpenCode and Ollama";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
 
-  outputs =
-    { self, nixpkgs }:
-    let
-      system = "x86_64-linux";
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
 
-      pkgs = import nixpkgs {
-        inherit system;
-        config.allowUnfree = true;
-      };
+        configDir = "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode-local";
 
-      settings = import ./nix/settings.nix;
+        # Default OpenCode config for Ollama
+        defaultConfig = pkgs.writeText "opencode.json" (builtins.toJSON {
+          "$schema" = "https://opencode.ai/config.json";
+          provider = {
+            ollama = {
+              npm = "@ai-sdk/openai-compatible";
+              name = "Ollama (local)";
+              options = {
+                baseURL = "http://localhost:11434/v1";
+              };
+              models = {
+                "qwen2.5-coder:7b" = { name = "Qwen 2.5 Coder 7B"; };
+                "qwen2.5-coder:14b" = { name = "Qwen 2.5 Coder 14B"; };
+                "deepseek-coder-v2:16b" = { name = "DeepSeek Coder V2 16B"; };
+                "codellama:13b" = { name = "Code Llama 13B"; };
+                "qwen3.6:35b-a3b" = { name = "Qwen 3.6 Coder 35B"; };
+              };
+            };
+          };
+        });
 
-      mkScript = import ./nix/mk-script.nix { inherit pkgs settings; };
-
-      agent = import ./nix/agent.nix { inherit mkScript pkgs; };
-      router = import ./nix/router.nix { inherit pkgs settings; };
-      hybrid = import ./nix/hybrid.nix {
-        inherit
-          mkScript
-          pkgs
-          router
-          settings
-          ;
-      };
-      setup = import ./nix/setup.nix { inherit mkScript; };
-      doctor = import ./nix/doctor.nix { inherit mkScript pkgs; };
-      bench = import ./nix/bench.nix { inherit mkScript; };
-      usage = import ./nix/usage.nix { inherit mkScript; };
-
-      allScripts = [
-        agent
-        hybrid
-        setup
-        doctor
-        bench
-        usage
-      ];
-
-      # The router is a python derivation rather than an mkScript one, so it
-      # is not in allScripts (which the nixos module iterates for shell
-      # applications) but still has to land on PATH wherever the scripts do.
-      allPackages = allScripts ++ [ router ];
-    in
-    {
-      packages.${system} = {
-        default = agent;
-        inherit
-          agent
-          hybrid
-          router
-          setup
-          doctor
-          bench
-          usage
-          ;
-        ollama = pkgs.ollama-cuda;
-      };
-
-      apps.${system} = {
-        default = {
-          type = "app";
-          program = "${agent}/bin/agent";
-          meta.description = "Start Claude Code on the local model";
-        };
-        setup = {
-          type = "app";
-          program = "${setup}/bin/local-ai-setup";
-          meta.description = "Pull and build the local models (run once)";
-        };
-        doctor = {
-          type = "app";
-          program = "${doctor}/bin/local-ai-doctor";
-          meta.description = "Diagnose context, eviction and cache settings";
-        };
-        bench = {
-          type = "app";
-          program = "${bench}/bin/local-ai-bench";
-          meta.description = "Measure prefill, cached prefill and generation";
-        };
-        hybrid = {
-          type = "app";
-          program = "${hybrid}/bin/hybrid-agent";
-          meta.description = "Start Claude Code on Claude, with local subagents";
-        };
-        router = {
-          type = "app";
-          program = "${router}/bin/local-ai-router";
-          meta.description = "Run the model-dispatch router on its own";
-        };
-        usage = {
-          type = "app";
-          program = "${usage}/bin/local-ai-usage";
-          meta.description = "Report the local-vs-remote token split";
-        };
-      };
-
-      nixosModules.default = import ./nix/nixos-module.nix {
-        agentPackages = allPackages;
-        inherit settings;
-      };
-
-      formatter.${system} = pkgs.nixfmt-tree;
-
-      checks.${system} = {
-        inherit
-          agent
-          hybrid
-          router
-          setup
-          doctor
-          bench
-          usage
-          ;
-
-        lint =
-          pkgs.runCommand "lint"
-            {
-              nativeBuildInputs = [
-                pkgs.statix
-                pkgs.deadnix
-              ];
-            }
-            ''
-              cd ${self}
-              statix check .
-              deadnix --fail .
-              touch $out
-            '';
-      };
-
-      devShells.${system}.default = pkgs.mkShell {
-        packages = allPackages ++ [
-          pkgs.ollama-cuda
-          pkgs.claude-code
-          pkgs.git
-          pkgs.ripgrep
-          pkgs.statix
-          pkgs.deadnix
-        ];
-
-        shellHook = ''
-          echo "local-ai-agent"
-          echo "  local-ai-setup   pull + build models (run once)"
-          echo "  local-ai-doctor  check context, eviction, cache settings"
-          echo "  local-ai-bench   measure prefill and generation"
-          echo "  local-ai-usage   local-vs-remote token split (hybrid mode)"
-          echo "  agent            start Claude Code on ${settings.agentModel} (all local, free, slow)"
-          echo "  hybrid-agent     start Claude Code on ${settings.hybrid.remoteMainModel}, with"
-          echo "                   ${settings.agentModel} subagents for the read-heavy work"
-          echo ""
-          echo "  context ${settings.defaultNumCtx} (override with AGENT_NUM_CTX)"
+        # Script to ensure Ollama is running
+        ensureOllama = pkgs.writeShellScript "ensure-ollama" ''
+          if ! ${pkgs.ollama}/bin/ollama list &>/dev/null; then
+            echo "Starting Ollama server..."
+            ${pkgs.ollama}/bin/ollama serve &
+            sleep 2
+          fi
         '';
-      };
-    };
+
+        # Main wrapper that sets up config and launches OpenCode
+        opencode-local = pkgs.writeShellApplication {
+          name = "opencode-local";
+          runtimeInputs = [ pkgs.opencode pkgs.ollama ];
+          text = ''
+            # Ensure config directory exists
+            mkdir -p "${configDir}"
+
+            # Copy default config if none exists
+            if [ ! -f "${configDir}/opencode.json" ]; then
+              cp ${defaultConfig} "${configDir}/opencode.json"
+              chmod 644 "${configDir}/opencode.json"
+              echo "Created default config at ${configDir}/opencode.json"
+            fi
+
+            # Ensure Ollama is running
+            ${ensureOllama}
+
+            # Check if a model is available
+            if ! ollama list | grep -q "qwen2.5-coder"; then
+              echo ""
+              echo "No coding model found. Pull one with:"
+              echo "  ollama pull qwen2.5-coder:7b"
+              echo ""
+              echo "Starting OpenCode anyway..."
+            fi
+
+            # Launch OpenCode with our config
+            OPENCODE_CONFIG="${configDir}/opencode.json" exec opencode "$@"
+          '';
+        };
+
+        # Helper to pull recommended models
+        pull-models = pkgs.writeShellApplication {
+          name = "pull-models";
+          runtimeInputs = [ pkgs.ollama ];
+          text = ''
+            echo "Pulling recommended coding models for offline use..."
+            echo ""
+
+            ${ensureOllama}
+
+            case "''${1:-small}" in
+              small)
+                echo "Pulling qwen2.5-coder:7b..."
+                ollama pull qwen2.5-coder:7b
+                ;;
+              medium)
+                echo "Pulling qwen2.5-coder:14b and deepseek-coder-v2:16b..."
+                ollama pull qwen2.5-coder:14b
+                ollama pull deepseek-coder-v2:16b
+                ;;
+              large)
+                echo "Pulling qwen3.6:35b-a3b..."
+                ollama pull qwen3.6:35b-a3b
+                ;;
+              *)
+                echo "Usage: pull-models [small|medium|large]"
+                echo ""
+                echo "  small  - qwen2.5-coder:7b"
+                echo "  medium - qwen2.5-coder:14b"
+                echo "  large  - qwen3.6:35b-a3b"
+                exit 1
+                ;;
+            esac
+
+            echo ""
+            echo "Done! Models are cached at ~/.ollama/models"
+          '';
+        };
+
+        # Bundle everything together
+        opencode-nix = pkgs.symlinkJoin {
+          name = "opencode-nix";
+          paths = [ opencode-local pull-models pkgs.ollama ];
+        };
+
+      in
+      {
+        packages = {
+          inherit opencode-local pull-models opencode-nix;
+          default = opencode-local;
+        };
+
+        devShells.default = pkgs.mkShell {
+          buildInputs = [ pkgs.opencode pkgs.ollama ];
+          shellHook = ''
+            echo "OpenCode + Ollama development shell"
+            echo ""
+            echo "Commands:"
+            echo "  ollama serve     - Start Ollama server"
+            echo "  ollama pull ...  - Download a model"
+            echo "  opencode         - Start OpenCode"
+          '';
+        };
+      });
 }
