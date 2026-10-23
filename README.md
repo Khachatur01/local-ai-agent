@@ -5,12 +5,12 @@ A Nix flake for running [OpenCode](https://github.com/sst/opencode) with local L
 ## Setup
 
 ```bash
-# Pull a coding model (while online)
-nix run github:Khachatur01/opencode-nix#pull-models -- small
-nix run github:Khachatur01/opencode-nix#pull-models -- medium
-nix run github:Khachatur01/opencode-nix#pull-models -- large
+# Pull a coding model (requires internet)
+nix run github:Khachatur01/opencode-nix#pull-models -- small   # qwen2.5-coder:7b
+nix run github:Khachatur01/opencode-nix#pull-models -- medium  # qwen2.5-coder:14b + deepseek-coder-v2:16b
+nix run github:Khachatur01/opencode-nix#pull-models -- large   # qwen3.6:35b-a3b
 
-# Run OpenCode
+# Run OpenCode (auto-starts Ollama if needed)
 nix run github:Khachatur01/opencode-nix
 ```
 
