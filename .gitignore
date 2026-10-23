@@ -2,11 +2,5 @@
 result
 result-*
 
-# Direnv, if someone uses it with this flake
+# Direnv cache (if using this flake with direnv)
 .direnv/
-
-# Claude Code's per-project local state. Note that .claude/settings.json and
-# .claude/agents/ ARE tracked on purpose: the permission allowlist keeps
-# classifier calls from firing, and the agent definitions are what hybrid
-# mode offloads to. Only the local override belongs out of the repo.
-.claude/settings.local.json

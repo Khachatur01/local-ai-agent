@@ -11,35 +11,55 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # Recommended model bundles - defined once, reused everywhere
+        recommendedModels = [
+          "qwen2.5-coder:7b"
+          "qwen2.5-coder:14b"
+          "deepseek-coder-v2:16b"
+          "codellama:13b"
+          "qwen3.6:35b-a3b"
+        ];
+
+        # Friendly display names for local models
+        friendlyNames = {
+          "qwen2.5-coder:7b"         = "Qwen 2.5 Coder 7B";
+          "qwen2.5-coder:14b"        = "Qwen 2.5 Coder 14B";
+          "deepseek-coder-v2:16b"    = "DeepSeek Coder V2 16B";
+          "codellama:13b"            = "Code Llama 13B";
+          "qwen3.6:35b-a3b"          = "Qwen 3.6 Coder 35B";
+        };
+
+        # Config data directory for Ollama logs  
         configDir = "\${XDG_CONFIG_HOME:-$HOME/.config}/opencode-local";
+
+        # Build modelList from friendlyNames as JSON array of {name, displayName} objects
+        modelList = builtins.mapAttrsToList (k: v: {
+          inherit k;
+          displayName = v;
+        }) friendlyNames;
 
         # Default OpenCode config for Ollama
         defaultConfig = pkgs.writeText "opencode.json" (builtins.toJSON {
           "$schema" = "https://opencode.ai/config.json";
           provider = {
             ollama = {
-              npm = "@ai-sdk/openai-compatible";
-              name = "Ollama (local)";
+              name  = "Ollama (local)";
+              npm   = "@ai-sdk/openai-compatible";
               options = {
-                baseURL = "http://localhost:11434/v1";
-              };
-              models = {
-                "qwen2.5-coder:7b" = { name = "Qwen 2.5 Coder 7B"; };
-                "qwen2.5-coder:14b" = { name = "Qwen 2.5 Coder 14B"; };
-                "deepseek-coder-v2:16b" = { name = "DeepSeek Coder V2 16B"; };
-                "codellama:13b" = { name = "Code Llama 13B"; };
-                "qwen3.6:35b-a3b" = { name = "Qwen 3.6 Coder 35B"; };
+                baseURL   = "http://localhost:11434/v1";
+                modelList = modelList;
               };
             };
           };
         });
 
-        # Script to ensure Ollama is running
+        # Script to ensure Ollama is running, with proper logging and longer startup timeout
         ensureOllama = pkgs.writeShellScript "ensure-ollama" ''
           if ! ${pkgs.ollama}/bin/ollama list &>/dev/null; then
             echo "Starting Ollama server..."
-            ${pkgs.ollama}/bin/ollama serve &
-            sleep 2
+            mkdir -p "$HOME/.local/share/opencode-local"
+            ${pkgs.ollama}/bin/ollama serve >> "$HOME/.local/share/opencode-local/ollama.log" 2>&1 &
+            disown
           fi
         '';
 
@@ -50,6 +70,7 @@
           text = ''
             # Ensure config directory exists
             mkdir -p "${configDir}"
+            mkdir -p "$HOME/.local/share/opencode-local"
 
             # Copy default config if none exists
             if [ ! -f "${configDir}/opencode.json" ]; then
@@ -61,8 +82,16 @@
             # Ensure Ollama is running
             ${ensureOllama}
 
-            # Check if a model is available
-            if ! ollama list | grep -q "qwen2.5-coder"; then
+            # Check if a coding model is available (exact tag match)
+            found=false
+            for m in ${builtins.concatStringsSep " " recommendedModels}; do
+              if ollama list | grep -q "^${m}\s"; then
+                echo "Found model: $m"
+                found=true; break
+              fi
+            done
+
+            if [ "$found" = "false" ]; then
               echo ""
               echo "No coding model found. Pull one with:"
               echo "  ollama pull qwen2.5-coder:7b"
@@ -85,7 +114,7 @@
 
             ${ensureOllama}
 
-            case "''${1:-small}" in
+            case "${1:-small}" in
               small)
                 echo "Pulling qwen2.5-coder:7b..."
                 ollama pull qwen2.5-coder:7b
@@ -102,9 +131,9 @@
               *)
                 echo "Usage: pull-models [small|medium|large]"
                 echo ""
-                echo "  small  - qwen2.5-coder:7b"
-                echo "  medium - qwen2.5-coder:14b"
-                echo "  large  - qwen3.6:35b-a3b"
+                echo "  small - qwen2.5-coder:7b"
+                echo "  medium - qwen2.5-coder:14b + deepseek-coder-v2:16b"
+                echo "  large - qwen3.6:35b-a3b"
                 exit 1
                 ;;
             esac
@@ -124,7 +153,7 @@
       {
         packages = {
           inherit opencode-local pull-models opencode-nix;
-          default = opencode-local;
+          default   = opencode-local;
         };
 
         devShells.default = pkgs.mkShell {
@@ -132,10 +161,13 @@
           shellHook = ''
             echo "OpenCode + Ollama development shell"
             echo ""
+            echo "WARNING: 'nix develop' requires internet to fetch missing derivations."
+            echo "For offline work, use 'nix run github:Khachatur01/opencode-nix' instead."
+            echo ""
             echo "Commands:"
-            echo "  ollama serve     - Start Ollama server"
-            echo "  ollama pull ...  - Download a model"
-            echo "  opencode         - Start OpenCode"
+            echo "  ollama serve - Start Ollama server"
+            echo "  ollama pull ... - Download a model"
+            echo "  opencode    - Start OpenCode"
           '';
         };
       });

@@ -17,10 +17,11 @@ nix run github:Khachatur01/opencode-nix
 ## Usage
 
 ```bash
-# Start OpenCode (auto-starts Ollama if needed)
+# Start OpenCode (auto-starts Ollama if needed; works offline)
 nix run github:Khachatur01/opencode-nix
 
 # Enter a dev shell with opencode and ollama available
+# Note: 'nix develop' requires internet on first use to fetch the derivation
 nix develop github:Khachatur01/opencode-nix
 ```
 
